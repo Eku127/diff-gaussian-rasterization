@@ -43,6 +43,7 @@ __forceinline__ __device__ float ndc2Pix(float v, int S)
 	return ((v + 1.0) * S - 1.0) * 0.5;
 }
 
+// 获取像素点落在的tile的坐标
 __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)
 {
 	rect_min = {
@@ -54,6 +55,16 @@ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& r
 		min(grid.y, max((int)0, (int)((p.y + max_radius + BLOCK_Y - 1) / BLOCK_Y)))
 	};
 }
+
+/* 
+ * 
+ * Matrix 中存放的就是相机的pose，是有16个
+ * 可以发现是列存储，所以只会有12个参与计算
+ * |	0	4	8	12	|	|	x	|
+ * |	1	5	9	13	|	|	y	|
+ * |	2	6	10	14	|	|	z	|
+ * |	3	7	11	15	|	|	1	|
+*/
 
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)
 {

@@ -41,6 +41,11 @@ def rasterize_gaussians(
         raster_settings,
     )
 
+# GPT: 通过继承 torch.autograd.Function 类并实现其中的 forward 和 backward 方法
+# 您可以定义自己的 autograd 函数，这些函数可以在 PyTorch 的计算图中进行自动微分
+# 使用的时候就是在nn.module中的forward中进行return调用，使用.apply进行forward操作
+# 同样，在loss backward的时候也会调用这个里面的backward
+# 调用C的接口
 class _RasterizeGaussians(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -80,6 +85,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         )
 
         # Invoke C++/CUDA rasterizer
+        # C++/CUDA的forward位置
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
@@ -129,6 +135,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.debug)
 
         # Compute gradients for relevant tensors by invoking backward method
+        # C++/CUDA的backward位置
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:

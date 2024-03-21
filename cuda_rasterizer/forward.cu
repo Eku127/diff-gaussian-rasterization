@@ -71,14 +71,25 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 }
 
 // Forward version of 2D covariance matrix computation
+// 计算投影的cov，公式5
 __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
 {
 	// The following models the steps outlined by equations 29
 	// and 31 in "EWA Splatting" (Zwicker et al., 2002). 
 	// Additionally considers aspect / scaling of viewport.
 	// Transposes used to account for row-/column-major conventions.
+	// 这边会使用transpose来变更不同的存储方式存储下来的矩阵
+	
+	// 1. 计算相机系下的中心点
+	// 从世界坐标系变换到相机坐标系
+	// 计算t的目的是为了计算Jacobian
+	// 
+	//	viewmatrix = | Rcw tcw |
+	//				 | 0   1   |
+	// u(3x1) --> t(3x1)
 	float3 t = transformPoint4x3(mean, viewmatrix);
 
+	// 2. 计算这个点下展开的Jacobian J
 	const float limx = 1.3f * tan_fovx;
 	const float limy = 1.3f * tan_fovy;
 	const float txtz = t.x / t.z;
@@ -86,23 +97,31 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 	t.x = min(limx, max(-limx, txtz)) * t.z;
 	t.y = min(limy, max(-limy, tytz)) * t.z;
 
+	// Equation (3) in "Math Gsplat"
 	glm::mat3 J = glm::mat3(
 		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
 		0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
 		0, 0, 0);
 
+	// 3. 计算Rcw，world to camera矩阵
+	// 本质上是取出旋转
 	glm::mat3 W = glm::mat3(
 		viewmatrix[0], viewmatrix[4], viewmatrix[8],
 		viewmatrix[1], viewmatrix[5], viewmatrix[9],
 		viewmatrix[2], viewmatrix[6], viewmatrix[10]);
 
+	// U = J * W
 	glm::mat3 T = W * J;
 
+	// 4. 计算sigma'
+	// sigma'(cov) = U * sigma * U^T
+	// 写作sigma，实际是sigma^T
 	glm::mat3 Vrk = glm::mat3(
 		cov3D[0], cov3D[1], cov3D[2],
 		cov3D[1], cov3D[3], cov3D[4],
 		cov3D[2], cov3D[4], cov3D[5]);
 
+	// 相当于上面的公式左右同时转置
 	glm::mat3 cov = glm::transpose(T) * glm::transpose(Vrk) * T;
 
 	// Apply low-pass filter: every Gaussian should be at least
@@ -115,6 +134,8 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 // Forward method for converting scale and rotation properties of each
 // Gaussian to a 3D covariance matrix in world space. Also takes care
 // of quaternion normalization.
+// reparametrization
+// 此处计算3D空间上的cov，通过s和r
 __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 rot, float* cov3D)
 {
 	// Create scaling matrix
@@ -124,6 +145,7 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 	S[2][2] = mod * scale.z;
 
 	// Normalize quaternion to get valid rotation
+	// TODO: Rotation的存储方式？xyzw还是wxyz，按照代码来看是后者
 	glm::vec4 q = rot;// / glm::length(rot);
 	float r = q.x;
 	float x = q.y;
@@ -131,12 +153,14 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 	float z = q.w;
 
 	// Compute rotation matrix from quaternion
+	// 没毛病，数学上相当于存了个R^T
 	glm::mat3 R = glm::mat3(
 		1.f - 2.f * (y * y + z * z), 2.f * (x * y - r * z), 2.f * (x * z + r * y),
 		2.f * (x * y + r * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - r * x),
 		2.f * (x * z - r * y), 2.f * (y * z + r * x), 1.f - 2.f * (x * x + y * y)
 	);
 
+	// row oriented
 	glm::mat3 M = S * R;
 
 	// Compute 3D world covariance matrix Sigma
@@ -189,11 +213,16 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	tiles_touched[idx] = 0;
 
 	// Perform near culling, quit if outside.
+	// 计算这个点在不在clip space里面
+	// 按照计算的逻辑基本上是来者不拒
 	float3 p_view;
 	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
 		return;
 
 	// Transform point by projecting
+	// projmatrix是直接可以将世界系点变换到NDC系下的，包含了View的变换
+	// gaussian_renderer/__init__.py 中对projmatrix赋值
+	// scene/cameras.py 中对Viewmat和projmat进行计算
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
@@ -201,6 +230,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// If 3D covariance matrix is precomputed, use it, otherwise compute
 	// from scaling and rotation parameters. 
+	// 通过S和R计算cov3D, 因为是对称矩阵，所以记录六个数即可
 	const float* cov3D;
 	if (cov3D_precomp != nullptr)
 	{
@@ -209,13 +239,19 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	else
 	{
 		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
+		// Get the cov3D indicator
 		cov3D = cov3Ds + idx * 6;
 	}
 
 	// Compute 2D screen-space covariance matrix
+	// 计算2D的投影
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
 
 	// Invert covariance (EWA algorithm)
+	// 计算cov_inv, 也就是这边写的conic
+	// 
+	// conic = 1 / det * | c   -b |
+	// 					 | -b  a  |
 	float det = (cov.x * cov.z - cov.y * cov.y);
 	if (det == 0.0f)
 		return;
@@ -226,13 +262,26 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// 2D covariance matrix). Use extent to compute a bounding rectangle
 	// of screen-space tiles that this Gaussian overlaps with. Quit if
 	// rectangle covers 0 tiles. 
+	// 求解特征值
+	// det(cov - lambda * I) = 0
+	// (c - lambda) * (a - lambda) - b^2 = 0
+	// 求解得到俩lambda
 	float mid = 0.5f * (cov.x + cov.z);
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
+	// 按照文章所述，用3*lambda作为判定区域
 	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+	// 求解uv坐标
+	// TODO: p_proj应该是相机坐标系下的点，这边不应该需要将点变换一次到ND系下去？
+	// p_view才是相机坐标系下的点，p_proj是NDC坐标系下的点
+	// projmatrix直接从世界系变换NDC系
+	// 之前就已经除以tw了
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+
+	// 通过uv坐标求解2D高斯椭圆覆盖的tile id
 	uint2 rect_min, rect_max;
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
+	// 
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
 
@@ -247,11 +296,16 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 
 	// Store some useful helper data for the next steps.
+	// 存放的内容，output的内容
+	// 点的相机系下的z
 	depths[idx] = p_view.z;
+	// 投影点的半径大小
 	radii[idx] = my_radius;
+	// 投影点的uv
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
+	// touch了多少
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
