@@ -18,6 +18,8 @@
 
 namespace CudaRasterizer
 {
+	// After obtaining the aligned memory, it updates the chunk pointer to point 
+	// to the next available memory location after the allocated space.
 	template <typename T>
 	static void obtain(char*& chunk, T*& ptr, std::size_t count, std::size_t alignment)
 	{

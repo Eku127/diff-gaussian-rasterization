@@ -215,6 +215,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// Perform near culling, quit if outside.
 	// 计算这个点在不在clip space里面
 	// 按照计算的逻辑基本上是来者不拒
+	// 是通过camera space下的z来计算的
 	float3 p_view;
 	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
 		return;
@@ -312,6 +313,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
+// 限制每个线程块的最大线程数量为 BLOCK_X * BLOCK_Y
 template <uint32_t CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
@@ -327,12 +329,20 @@ renderCUDA(
 	float* __restrict__ out_color)
 {
 	// Identify current tile and associated min/max pixel range.
+	// 创建线程块
 	auto block = cg::this_thread_block();
+	// 水平方向的线程块数目
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	// 最大最小像素坐标
+	// block.group_index() ---- 当前block在grid中的索引，blockIdx
 	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
 	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	// 当前thread对应的像素点在图象上坐标
+	// block.thread_index() ---- 代表当前thread在block中的索引，threadIdx
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	// 二维坐标变成一维坐标后像素的id
 	uint32_t pix_id = W * pix.y + pix.x;
+	// as float
 	float2 pixf = { (float)pix.x, (float)pix.y };
 
 	// Check if this thread is associated with a valid pixel or outside.
@@ -341,48 +351,76 @@ renderCUDA(
 	bool done = !inside;
 
 	// Load start/end range of IDs to process in bit sorted list.
+	// 找到当前tile对应的高斯信息，基于之前的计算结果
+	// block.group_index() 当前tile的id
+	// 当前tile对应的高斯球id list
+	// number of Gaussians for this tile.
 	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	// 每一个线程需要计算的大概高斯球数量
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	// 当前tile对应的高斯球数量
 	int toDo = range.y - range.x;
 
 	// Allocate storage for batches of collectively fetched data.
+	// 同一个block(tile)中共享的内容
+	// 各个线程处理的高斯球编号id
 	__shared__ int collected_id[BLOCK_SIZE];
+	// ~ 2d平面投影坐标
 	__shared__ float2 collected_xy[BLOCK_SIZE];
+	// ~ 2d协方差的逆以及不透明度
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 
 	// Initialize helper variables
+	// 透射率
 	float T = 1.0f;
+	// 计算经过了多少高斯
 	uint32_t contributor = 0;
+	// 最终经过的高斯球数量
 	uint32_t last_contributor = 0;
+	// 最后渲染的颜色
 	float C[CHANNELS] = { 0 };
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
 		// End if entire block votes that it is done rasterizing
+		// 如果一个block里面全部thread完成，则退出循环
 		int num_done = __syncthreads_count(done);
 		if (num_done == BLOCK_SIZE)
 			break;
 
 		// Collectively fetch per-Gaussian data from global to shared
+		// 对于同一个block，把所有的高斯球全部存到shared内存中，这样方便后续的使用
+		// 因此这个block中的每一个线程都会直接从shared mem中获取得到这个block对应的gaussian的信息
+		// thread_rank：当前线程在组内的标号，区间为[0, num_threads)
 		int progress = i * BLOCK_SIZE + block.thread_rank();
+		// 当前线程有效，高斯球不越界
 		if (range.x + progress < range.y)
 		{
+			// 当前线程处理的高斯球编号
 			int coll_id = point_list[range.x + progress];
+			// 当前线程高斯球处理的id
 			collected_id[block.thread_rank()] = coll_id;
+			// 当前线程高斯球2d中心坐标
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			// 协方差+不透明度
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 		}
+		// 这是一个 CUDA 中的内置函数，用于在当前线程块内进行同步操作。
+		// 它会阻塞调用该函数的所有线程，直到该线程块内的所有线程都执行到了这个同步点为止
 		block.sync();
 
 		// Iterate over current batch
+		// 每一个线程遍历高斯球
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
 		{
 			// Keep track of current position in range
+			// 高斯球计数
 			contributor++;
 
 			// Resample using conic matrix (cf. "Surface 
 			// Splatting" by Zwicker et al., 2001)
+			// 通过当前pixf点到这个高斯点的距离解算概率密度函数
 			float2 xy = collected_xy[j];
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			float4 con_o = collected_conic_opacity[j];
@@ -395,9 +433,12 @@ renderCUDA(
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
 			float alpha = min(0.99f, con_o.w * exp(power));
+			// 如果alpha太小就不要
 			if (alpha < 1.0f / 255.0f)
 				continue;
+			// 通过alpha计算Transmittance
 			float test_T = T * (1 - alpha);
+			// T太小就跳过，并且认为就是结束了
 			if (test_T < 0.0001f)
 			{
 				done = true;
@@ -405,6 +446,9 @@ renderCUDA(
 			}
 
 			// Eq. (3) from 3D Gaussian splatting paper.
+			// 解算color
+			// Every Gaussian gets added onto every pixel (color += color * alpha * T) 
+			// until a pixel gets fully rendered, i.e., T is close to 0:
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
 
@@ -412,6 +456,7 @@ renderCUDA(
 
 			// Keep track of last range entry to update this
 			// pixel.
+			// 记录
 			last_contributor = contributor;
 		}
 	}
@@ -479,6 +524,10 @@ void FORWARD::preprocess(int P, int D, int M,
 	uint32_t* tiles_touched,
 	bool prefiltered)
 {
+	// (P + 255) / 256 calculates the number of blocks
+	// needed based on the total number of elements P and 
+	// the desired number of threads per block
+	// 256, specifies the number of threads per block.
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
 		means3D,

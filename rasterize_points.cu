@@ -58,6 +58,7 @@ RasterizeGaussiansCUDA(
     AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
   
+  // P就是代表了number of points
   const int P = means3D.size(0);
   const int H = image_height;
   const int W = image_width;
