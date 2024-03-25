@@ -443,6 +443,7 @@ renderCUDA(
 
 	// We start from the back. The ID of the last contributing
 	// Gaussian is known from each pixel from the forward.
+	// 从后往前
 	uint32_t contributor = toDo;
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
@@ -465,6 +466,8 @@ renderCUDA(
 	{
 		// Load auxiliary data into shared memory, start in the BACK
 		// and load them in revers order.
+		// 同样load所需要的信息进入到shared mem中，不过是从后往前
+		// blockwise的操作，一个tile搞一次
 		block.sync();
 		const int progress = i * BLOCK_SIZE + block.thread_rank();
 		if (range.x + progress < range.y)
@@ -479,10 +482,14 @@ renderCUDA(
 		block.sync();
 
 		// Iterate over Gaussians
+		// 对这个pix对应的gaussian分量进行遍历
+		// https://zichen34.github.io/writenotes/model/splat/b-note-3dgs-code/#step-into-cuda-kernels
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
 		{
 			// Keep track of current Gaussian ID. Skip, if this one
 			// is behind the last contributor for this pixel.
+			// 如果这个gaussian没有参与到前向render，那么就也不会参加后向的梯度计算
+			// last contribute的gaussian同样也会跳过
 			contributor--;
 			if (contributor >= last_contributor)
 				continue;
@@ -491,6 +498,7 @@ renderCUDA(
 			const float2 xy = collected_xy[j];
 			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			const float4 con_o = collected_conic_opacity[j];
+			// power就是paper里面的sigma
 			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
@@ -500,34 +508,63 @@ renderCUDA(
 			if (alpha < 1.0f / 255.0f)
 				continue;
 
+			// Accumulated transmittance over all Gaussians is known, 
+			// so accumulated transmittance of each Gaussian can be accquired
+			// 1. 计算color分量
+			// Equation (16) & (17) from Mathematical gsplat paper
 			T = T / (1.f - alpha);
+			// dC_i(k) / dc_n(k)
 			const float dchannel_dcolor = alpha * T;
 
 			// Propagate gradients to per-Gaussian colors and keep
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
 			// pair).
+
+			// 2. 计算alpha分量
 			float dL_dalpha = 0.0f;
 			const int global_id = collected_id[j];
 			for (int ch = 0; ch < C; ch++)
 			{
 				const float c = collected_colors[ch * BLOCK_SIZE + j];
 				// Update last color (to be used in the next iteration)
+				// Equation (18) from Mathematical gsplat paper
+				// 和paper上有稍微不同，记住需要从后往前计算，用的是另一种迭代的方式（倒着往前，从后往前迭代）
+				// pix = ... (n-1) <-- (n) <-- (n+1) <-- (n+2)
+
+				// Accum(n+1) = c(n+1)alpha(n+1) + Accum(n+2)(1 - alpha(n+1))
+				// d_C/d_alpha(n) = (c(n) - Accum(n+1)) * T(n)
+
+				// Accum(n) = c(n)alpha(n) + Accum(n+1)(1 - alpha(n))
+				// d_C/d_alpha(n-1) = (c(n-1) - Accum(n)) * T(n-1)
+
+				// 对于n来说，n+1就是last；对于n-1来说，n就是last
+				// alpha就是通过这种方式来进行迭代的
+
 				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
 				last_color[ch] = c;
 
 				const float dL_dchannel = dL_dpixel[ch];
+				// 累加所有channel的dd项
 				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
 				// Update the gradients w.r.t. color of the Gaussian. 
 				// Atomic, since this pixel is just one of potentially
 				// many that were affected by this Gaussian.
+				// 此处是实际上的计算color分量对L的贡献
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
+			// * T(n)
 			dL_dalpha *= T;
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
 
 			// Account for fact that alpha also influences how much of
 			// the background color is added if nothing left to blend
+			// Background就是那些在last contributor后面的颜色
+			// 需要考虑bg color对最终pixel颜色的影响；color来源于Gaussian以及background
+			// C_pix = C_gs + T_final * C_bg
+			// dC_pix(bg part)/dalpha_gs 
+			// = dT_final/dalpha_gs * C_bg 
+			// = -(T_final / (1 - alpha_gs)) * C_bg
 			float bg_dot_dpixel = 0;
 			for (int i = 0; i < C; i++)
 				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
@@ -535,6 +572,8 @@ renderCUDA(
 
 
 			// Helpful reusable temporary variables
+			// alpha = opacity * G = opacity * exp(-sigma(n))
+			// G = exp(-sigma(n))
 			const float dL_dG = con_o.w * dL_dalpha;
 			const float gdx = G * d.x;
 			const float gdy = G * d.y;
@@ -542,15 +581,19 @@ renderCUDA(
 			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
 
 			// Update gradients w.r.t. 2D mean position of the Gaussian
+			// Equation (19) below解释了，草稿纸上也能写出来
 			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
 			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
 
 			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+			// 写出sigma对于cov_inv(conic)中所有元素的表达式，然后依次偏导
 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
 
 			// Update gradients w.r.t. opacity of the Gaussian
+			// alpha = G * opacity
+			// dL/dopacity = dL/dalpha * dalpha/dopacity = dL/dalpha * G
 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
 		}
 	}

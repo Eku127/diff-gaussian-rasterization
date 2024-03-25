@@ -381,6 +381,7 @@ renderCUDA(
 	float C[CHANNELS] = { 0 };
 
 	// Iterate over batches until all done or range is complete
+	// https://zichen34.github.io/writenotes/model/splat/b-note-3dgs-code/#step-into-cuda-kernels
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
 		// End if entire block votes that it is done rasterizing

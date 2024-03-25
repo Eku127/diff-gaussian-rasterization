@@ -397,6 +397,9 @@ int CudaRasterizer::Rasterizer::forward(
 
 // Produce necessary gradients for optimization, corresponding
 // to forward render pass
+
+// backward的入口函数，主流程
+// incoming gradient --- dL_dpixels
 void CudaRasterizer::Rasterizer::backward(
 	const int P, int D, int M, int R,
 	const float* background,
