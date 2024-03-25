@@ -587,6 +587,12 @@ renderCUDA(
 
 			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
 			// 写出sigma对于cov_inv(conic)中所有元素的表达式，然后依次偏导
+			// 值得注意的是，math gsplatpaper中求解得到的是Loss w.r.t. Sigma(2D)的导数表达式
+			// 这边没有求解对Sigma(2D)的，而是直接求解Sigma(2D)^-1的，也就是对cov_inv(conic)的
+			// 因此这边会和Equation (21) 有出入
+			// delta = [ux - pix.x uy - pix.y]^T
+			// sigma = 0.5 * delta^T * Sigma(2D)^-1 * delta
+			// d_sigma/d_Sigma(2D)^-1 = 0.5 * (delta * delta^T) <--- 二项式求导
 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
@@ -627,6 +633,7 @@ void BACKWARD::preprocess(
 	// Somewhat long, thus it is its own kernel rather than being part of 
 	// "preprocess". When done, loss gradient w.r.t. 3D means has been
 	// modified and gradient w.r.t. 3D covariance matrix has been computed.	
+	// 看上面的介绍，这一步是在解算dL/du(3D),dL/dsigma(3D)
 	computeCov2DCUDA << <(P + 255) / 256, 256 >> > (
 		P,
 		means3D,
