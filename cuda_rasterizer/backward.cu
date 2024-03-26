@@ -141,6 +141,7 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 // Backward version of INVERSE 2D covariance matrix computation
 // (due to length launched as separate kernel before other 
 // backward steps contained in preprocess)
+// 注意这里，是INVERSE 的cov的导数信息进行回传
 __global__ void computeCov2DCUDA(int P,
 	const float3* means,
 	const int* radii,
@@ -157,12 +158,17 @@ __global__ void computeCov2DCUDA(int P,
 		return;
 
 	// Reading location of 3D covariance for this Gaussian
+	// 获取XX系下的cov 3d信息
+	// TODO: judge whether if it is world coord
 	const float* cov3D = cov3Ds + 6 * idx;
 
 	// Fetch gradients, recompute 2D covariance and relevant 
 	// intermediate forward results needed in the backward.
+	// mean in world coordinate
 	float3 mean = means[idx];
+	// 获取d_L / d_sigma(2d)^-1
 	float3 dL_dconic = { dL_dconics[4 * idx], dL_dconics[4 * idx + 1], dL_dconics[4 * idx + 3] };
+	// 高斯中心点变换到相机坐标系下
 	float3 t = transformPoint4x3(mean, view_matrix);
 	
 	const float limx = 1.3f * tan_fovx;
@@ -175,45 +181,67 @@ __global__ void computeCov2DCUDA(int P,
 	const float x_grad_mul = txtz < -limx || txtz > limx ? 0 : 1;
 	const float y_grad_mul = tytz < -limy || tytz > limy ? 0 : 1;
 
+	// 同样计算在该点展开的Jacobian --> J_k
 	glm::mat3 J = glm::mat3(h_x / t.z, 0.0f, -(h_x * t.x) / (t.z * t.z),
 		0.0f, h_y / t.z, -(h_y * t.y) / (t.z * t.z),
 		0, 0, 0);
 
+	// R_cw
 	glm::mat3 W = glm::mat3(
 		view_matrix[0], view_matrix[4], view_matrix[8],
 		view_matrix[1], view_matrix[5], view_matrix[9],
 		view_matrix[2], view_matrix[6], view_matrix[10]);
 
+	// Sigma
 	glm::mat3 Vrk = glm::mat3(
 		cov3D[0], cov3D[1], cov3D[2],
 		cov3D[1], cov3D[3], cov3D[4],
 		cov3D[2], cov3D[4], cov3D[5]);
 
+	// U = J_k * R_cw
 	glm::mat3 T = W * J;
 
+	// 计算Sigma'
+	// Sigma'(2D) = U * sigma(3D) * U^T
 	glm::mat3 cov2D = glm::transpose(T) * glm::transpose(Vrk) * T;
 
 	// Use helper variables for 2D covariance entries. More compact.
+	// 和之前一样的abc定义，+小量保证数值稳定
 	float a = cov2D[0][0] += 0.3f;
 	float b = cov2D[0][1];
 	float c = cov2D[1][1] += 0.3f;
 
+	// 计算det
 	float denom = a * c - b * b;
 	float dL_da = 0, dL_db = 0, dL_dc = 0;
+
 	float denom2inv = 1.0f / ((denom * denom) + 0.0000001f);
 
+	/// “dL/dcov(3D)”
 	if (denom2inv != 0)
-	{
+	{	
+		/// From dL/dcov_inv(2D) to dL/dcov(2D) 
 		// Gradients of loss w.r.t. entries of 2D covariance matrix,
 		// given gradients of loss w.r.t. conic matrix (inverse covariance matrix).
 		// e.g., dL / da = dL / d_conic_a * d_conic_a / d_a
+		// 详细见草稿笔记= =
+		// 每一个元素的变动会引起矩阵的变化，然后矩阵变化会传递到Loss
+		// 因此，以a举例，先解算a的变化对矩阵cov_inv的变化（由于inv是通过det计算的，所以表达式含有det）
+		// 然后使用hadamard积来将矩阵四个元素的变化统一成一个标量Loss的变化，毕竟dL / d_conic已知
+		// 远远复杂于上面写的这个链式计算，正确的应该是
+		// dL / da = dL / d_conic * d_conic / d_a
 		dL_da = denom2inv * (-c * c * dL_dconic.x + 2 * b * c * dL_dconic.y + (denom - a * c) * dL_dconic.z);
 		dL_dc = denom2inv * (-a * a * dL_dconic.z + 2 * a * b * dL_dconic.y + (denom - a * c) * dL_dconic.x);
 		dL_db = denom2inv * 2 * (b * c * dL_dconic.x - (denom + 2 * b * b) * dL_dconic.y + a * b * dL_dconic.z);
 
+		/// From dL/dcov(2D) to dL/dcov(3D)
 		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry, 
 		// given gradients w.r.t. 2D covariance matrix (diagonal).
 		// cov2D = transpose(T) * transpose(Vrk) * T;
+		// 草稿笔记的话这边使用的是U来代替T
+		// 和上面类似，显式写出这些结果
+		// TODO: 按照公式推导这边应该也还是需要x2，对于b的这一项
+		// 这边是Loss w.r.t. cov(3D) 对角线元素
 		dL_dcov[6 * idx + 0] = (T[0][0] * T[0][0] * dL_da + T[0][0] * T[1][0] * dL_db + T[1][0] * T[1][0] * dL_dc);
 		dL_dcov[6 * idx + 3] = (T[0][1] * T[0][1] * dL_da + T[0][1] * T[1][1] * dL_db + T[1][1] * T[1][1] * dL_dc);
 		dL_dcov[6 * idx + 5] = (T[0][2] * T[0][2] * dL_da + T[0][2] * T[1][2] * dL_db + T[1][2] * T[1][2] * dL_dc);
@@ -222,6 +250,7 @@ __global__ void computeCov2DCUDA(int P,
 		// given gradients w.r.t. 2D covariance matrix (off-diagonal).
 		// Off-diagonal elements appear twice --> double the gradient.
 		// cov2D = transpose(T) * transpose(Vrk) * T;
+		// 非对角线元素
 		dL_dcov[6 * idx + 1] = 2 * T[0][0] * T[0][1] * dL_da + (T[0][0] * T[1][1] + T[0][1] * T[1][0]) * dL_db + 2 * T[1][0] * T[1][1] * dL_dc;
 		dL_dcov[6 * idx + 2] = 2 * T[0][0] * T[0][2] * dL_da + (T[0][0] * T[1][2] + T[0][2] * T[1][0]) * dL_db + 2 * T[1][0] * T[1][2] * dL_dc;
 		dL_dcov[6 * idx + 4] = 2 * T[0][2] * T[0][1] * dL_da + (T[0][1] * T[1][2] + T[0][2] * T[1][1]) * dL_db + 2 * T[1][1] * T[1][2] * dL_dc;
@@ -232,6 +261,9 @@ __global__ void computeCov2DCUDA(int P,
 			dL_dcov[6 * idx + i] = 0;
 	}
 
+	/// “dL/dU”
+	// 同样也是计算each element
+	// 写出cov(2D)[即Sigma’] 关于 U 和 cov(3D)[即Sigma] 各个元素的表达式即可求解得到以下结果
 	// Gradients of loss w.r.t. upper 2x3 portion of intermediate matrix T
 	// cov2D = transpose(T) * transpose(Vrk) * T;
 	float dL_dT00 = 2 * (T[0][0] * Vrk[0][0] + T[0][1] * Vrk[0][1] + T[0][2] * Vrk[0][2]) * dL_da +
@@ -247,6 +279,8 @@ __global__ void computeCov2DCUDA(int P,
 	float dL_dT12 = 2 * (T[1][0] * Vrk[2][0] + T[1][1] * Vrk[2][1] + T[1][2] * Vrk[2][2]) * dL_dc +
 		(T[0][0] * Vrk[2][0] + T[0][1] * Vrk[2][1] + T[0][2] * Vrk[2][2]) * dL_db;
 
+	/// "dL/dJ"
+	// 同上，也是写出 U 几项和 J 以及 Rcw 几项之间的关系，通过dL/dU链式+hadamard积来求解
 	// Gradients of loss w.r.t. upper 3x2 non-zero entries of Jacobian matrix
 	// T = W * J
 	float dL_dJ00 = W[0][0] * dL_dT00 + W[0][1] * dL_dT01 + W[0][2] * dL_dT02;
@@ -259,17 +293,22 @@ __global__ void computeCov2DCUDA(int P,
 	float tz3 = tz2 * tz;
 
 	// Gradients of loss w.r.t. transformed Gaussian mean t
+	// 此处解出一部分loss对于t的导数，也就是 equation 22 的后部分
+	// 也就是下面说的 “mean affects the covariance matrix”
+	// t影响Sigma从而影响Loss的部分
 	float dL_dtx = x_grad_mul * -h_x * tz2 * dL_dJ02;
 	float dL_dty = y_grad_mul * -h_y * tz2 * dL_dJ12;
 	float dL_dtz = -h_x * tz2 * dL_dJ00 - h_y * tz2 * dL_dJ11 + (2 * h_x * t.x) * tz3 * dL_dJ02 + (2 * h_y * t.y) * tz3 * dL_dJ12;
 
 	// Account for transformation of mean to t
 	// t = transformPoint4x3(mean, view_matrix);
+	// 将camera系下的t变换回世界系下的u，对应equation (28)的后半部分
 	float3 dL_dmean = transformVec4x3Transpose({ dL_dtx, dL_dty, dL_dtz }, view_matrix);
 
 	// Gradients of loss w.r.t. Gaussian means, but only the portion 
 	// that is caused because the mean affects the covariance matrix.
 	// Additional mean gradient is accumulated in BACKWARD::preprocess.
+	// equation 22 的后部分
 	dL_dmeans[idx] = dL_dmean;
 }
 
@@ -593,6 +632,7 @@ renderCUDA(
 			// delta = [ux - pix.x uy - pix.y]^T
 			// sigma = 0.5 * delta^T * Sigma(2D)^-1 * delta
 			// d_sigma/d_Sigma(2D)^-1 = 0.5 * (delta * delta^T) <--- 二项式求导
+			// 将delta使用代码中的 d.x 和 d.y 进行代替，并一一对应，可以得到以下的结果
 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
@@ -634,6 +674,8 @@ void BACKWARD::preprocess(
 	// "preprocess". When done, loss gradient w.r.t. 3D means has been
 	// modified and gradient w.r.t. 3D covariance matrix has been computed.	
 	// 看上面的介绍，这一步是在解算dL/du(3D),dL/dsigma(3D)
+	// renderCUDA解出来对2D的结果，进一步推导到3D
+	// 注意对于cov，这边只有对cov的逆的结果（conic）
 	computeCov2DCUDA << <(P + 255) / 256, 256 >> > (
 		P,
 		means3D,
