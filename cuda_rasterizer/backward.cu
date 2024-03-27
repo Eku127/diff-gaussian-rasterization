@@ -382,56 +382,65 @@ __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const gl
 // Backward pass of the preprocessing steps, except
 // for the covariance computation and inversion
 // (those are handled by a previous kernel call)
-template<int C>
+// 1. finish 3D mean gradients, (add first part of euqation 22)
+// 2. propagate color gradients to SH (if desireD),
+// 3. propagate 3D covariance matrix gradients to scale and rotation.
+template <int C>
 __global__ void preprocessCUDA(
-	int P, int D, int M,
-	const float3* means,
-	const int* radii,
-	const float* shs,
-	const bool* clamped,
-	const glm::vec3* scales,
-	const glm::vec4* rotations,
-	const float scale_modifier,
-	const float* proj,
-	const glm::vec3* campos,
-	const float3* dL_dmean2D,
-	glm::vec3* dL_dmeans,
-	float* dL_dcolor,
-	float* dL_dcov3D,
-	float* dL_dsh,
-	glm::vec3* dL_dscale,
-	glm::vec4* dL_drot)
-{
-	auto idx = cg::this_grid().thread_rank();
-	if (idx >= P || !(radii[idx] > 0))
-		return;
+    int P, int D, int M, const float3* means, const int* radii,
+    const float* shs, const bool* clamped, const glm::vec3* scales,
+    const glm::vec4* rotations, const float scale_modifier, const float* proj,
+    const glm::vec3* campos, const float3* dL_dmean2D, glm::vec3* dL_dmeans,
+    float* dL_dcolor, float* dL_dcov3D, float* dL_dsh, glm::vec3* dL_dscale,
+    glm::vec4* dL_drot) {
+    auto idx = cg::this_grid().thread_rank();
+    if (idx >= P || !(radii[idx] > 0)) return;
 
-	float3 m = means[idx];
+    float3 m = means[idx];
 
-	// Taking care of gradients from the screenspace points
-	float4 m_hom = transformPoint4x4(m, proj);
-	float m_w = 1.0f / (m_hom.w + 0.0000001f);
+    // Taking care of gradients from the screenspace points
+    // 世界系下点u --> ray系下点t'
+    float4 m_hom = transformPoint4x4(m, proj);
+    float m_w = 1.0f / (m_hom.w + 0.0000001f);
 
-	// Compute loss gradient w.r.t. 3D means due to gradients of 2D means
-	// from rendering procedure
-	glm::vec3 dL_dmean;
-	float mul1 = (proj[0] * m.x + proj[4] * m.y + proj[8] * m.z + proj[12]) * m_w * m_w;
-	float mul2 = (proj[1] * m.x + proj[5] * m.y + proj[9] * m.z + proj[13]) * m_w * m_w;
-	dL_dmean.x = (proj[0] * m_w - proj[3] * mul1) * dL_dmean2D[idx].x + (proj[1] * m_w - proj[3] * mul2) * dL_dmean2D[idx].y;
-	dL_dmean.y = (proj[4] * m_w - proj[7] * mul1) * dL_dmean2D[idx].x + (proj[5] * m_w - proj[7] * mul2) * dL_dmean2D[idx].y;
-	dL_dmean.z = (proj[8] * m_w - proj[11] * mul1) * dL_dmean2D[idx].x + (proj[9] * m_w - proj[11] * mul2) * dL_dmean2D[idx].y;
+    // Compute loss gradient w.r.t. 3D means due to gradients of 2D means
+    // from rendering procedure
+    // Equation(23) & (28)
+    // Here we calculate dL/du, Equation(23) get dL/dt and Equation(28)
+    // transfer t to u, which is dL_dmean here.
+	// Ans: 注意这边括号里的内容其实就是m_hom.x 以及m_hom.y, 也就是公式中的t'x, t'y
+	// 不知道为什么这边要写成proj和世界系下点m的乘积的结果，明明前面使用函数
+	// transformPoint4x4已经计算过了= =
+	// 这边被坑了一下
+    glm::vec3 dL_dmean;
+	// t'x / (t'w * t'w)
+    float mul1 =
+        (proj[0] * m.x + proj[4] * m.y + proj[8] * m.z + proj[12]) * m_w * m_w;
+	// t'y / (t'w * t'w)
+    float mul2 =
+        (proj[1] * m.x + proj[5] * m.y + proj[9] * m.z + proj[13]) * m_w * m_w;
+    dL_dmean.x = (proj[0] * m_w - proj[3] * mul1) * dL_dmean2D[idx].x +
+                 (proj[1] * m_w - proj[3] * mul2) * dL_dmean2D[idx].y;
+    dL_dmean.y = (proj[4] * m_w - proj[7] * mul1) * dL_dmean2D[idx].x +
+                 (proj[5] * m_w - proj[7] * mul2) * dL_dmean2D[idx].y;
+    dL_dmean.z = (proj[8] * m_w - proj[11] * mul1) * dL_dmean2D[idx].x +
+                 (proj[9] * m_w - proj[11] * mul2) * dL_dmean2D[idx].y;
 
-	// That's the second part of the mean gradient. Previous computation
-	// of cov2D and following SH conversion also affects it.
-	dL_dmeans[idx] += dL_dmean;
+    // That's the second part of the mean gradient. Previous computation
+    // of cov2D and following SH conversion also affects it.
+	// 对应equation(22) in gsplat
+    dL_dmeans[idx] += dL_dmean;
 
-	// Compute gradient updates due to computing colors from SHs
-	if (shs)
-		computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh);
+    // Compute gradient updates due to computing colors from SHs
+    if (shs)
+        computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs, clamped,
+                           (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans,
+                           (glm::vec3*)dL_dsh);
 
-	// Compute gradient updates due to computing covariance from scale/rotation
-	if (scales)
-		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
+    // Compute gradient updates due to computing covariance from scale/rotation
+    if (scales)
+        computeCov3D(idx, scales[idx], scale_modifier, rotations[idx],
+                     dL_dcov3D, dL_dscale, dL_drot);
 }
 
 // Backward version of the rendering procedure.
@@ -673,9 +682,10 @@ void BACKWARD::preprocess(
 	// Somewhat long, thus it is its own kernel rather than being part of 
 	// "preprocess". When done, loss gradient w.r.t. 3D means has been
 	// modified and gradient w.r.t. 3D covariance matrix has been computed.	
-	// 看上面的介绍，这一步是在解算dL/du(3D),dL/dsigma(3D)
+	// 看上面的介绍，这一步是在解算一部分dL/du(3D),dL/dsigma(3D)
 	// renderCUDA解出来对2D的结果，进一步推导到3D
 	// 注意对于cov，这边只有对cov的逆的结果（conic）
+	// 这里的一部分是指从cov影响mean的部分，mean直接影响的部分会在下面加上去
 	computeCov2DCUDA << <(P + 255) / 256, 256 >> > (
 		P,
 		means3D,
@@ -690,9 +700,10 @@ void BACKWARD::preprocess(
 		(float3*)dL_dmean3D,
 		dL_dcov3D);
 
-	// Propagate gradients for remaining steps: finish 3D mean gradients,
-	// propagate color gradients to SH (if desireD), propagate 3D covariance
-	// matrix gradients to scale and rotation.
+	// Propagate gradients for remaining steps: 
+	// 1. finish 3D mean gradients, (add first part of euqation 22)
+	// 2. propagate color gradients to SH (if desireD), 
+	// 3. propagate 3D covariance matrix gradients to scale and rotation.
 	preprocessCUDA<NUM_CHANNELS> << < (P + 255) / 256, 256 >> > (
 		P, D, M,
 		(float3*)means3D,
