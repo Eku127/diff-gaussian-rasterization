@@ -314,10 +314,13 @@ __global__ void computeCov2DCUDA(int P,
 
 // Backward pass for the conversion of scale and rotation to a 
 // 3D covariance matrix for each Gaussian. 
-__device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const glm::vec4 rot, const float* dL_dcov3Ds, glm::vec3* dL_dscales, glm::vec4* dL_drots)
-{
-	// Recompute (intermediate) results for the 3D covariance computation.
+// Given dL / dcov(3D)[Sigma], find dL / ds & dL / dq
+__device__ void computeCov3D(int idx, const glm::vec3 scale, float mod,
+                             const glm::vec4 rot, const float* dL_dcov3Ds,
+                             glm::vec3* dL_dscales, glm::vec4* dL_drots) {
+    // Recompute (intermediate) results for the 3D covariance computation.
 	glm::vec4 q = rot;// / glm::length(rot);
+	// 注意这里的定义
 	float r = q.x;
 	float x = q.y;
 	float y = q.z;
@@ -352,29 +355,40 @@ __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const gl
 
 	// Compute loss gradient w.r.t. matrix M
 	// dSigma_dM = 2 * M
+	// 这边没有transpose是因为行主列这些的缘故
 	glm::mat3 dL_dM = 2.0f * M * dL_dSigma;
 
 	glm::mat3 Rt = glm::transpose(R);
 	glm::mat3 dL_dMt = glm::transpose(dL_dM);
 
 	// Gradients of loss w.r.t. scale
+	// Equation(30) latter equation
 	glm::vec3* dL_dscale = dL_dscales + idx;
 	dL_dscale->x = glm::dot(Rt[0], dL_dMt[0]);
 	dL_dscale->y = glm::dot(Rt[1], dL_dMt[1]);
 	dL_dscale->z = glm::dot(Rt[2], dL_dMt[2]);
 
+	// Equation(30) former equation
+	// 现在dL_dMt 变成dL_dR啦
 	dL_dMt[0] *= s.x;
 	dL_dMt[1] *= s.y;
 	dL_dMt[2] *= s.z;
 
 	// Gradients of loss w.r.t. normalized quaternion
 	glm::vec4 dL_dq;
+	// dL_dR * dR_dx (dy, dz, dw)
+	// 又是一个标量对矩阵，矩阵对标量的链式法则，轻车熟路使用hadmard积
+	// dR_dw from math gsplat
 	dL_dq.x = 2 * z * (dL_dMt[0][1] - dL_dMt[1][0]) + 2 * y * (dL_dMt[2][0] - dL_dMt[0][2]) + 2 * x * (dL_dMt[1][2] - dL_dMt[2][1]);
+	// dR_dx from math gsplat
 	dL_dq.y = 2 * y * (dL_dMt[1][0] + dL_dMt[0][1]) + 2 * z * (dL_dMt[2][0] + dL_dMt[0][2]) + 2 * r * (dL_dMt[1][2] - dL_dMt[2][1]) - 4 * x * (dL_dMt[2][2] + dL_dMt[1][1]);
+	// dR_dy from math gsplat
 	dL_dq.z = 2 * x * (dL_dMt[1][0] + dL_dMt[0][1]) + 2 * r * (dL_dMt[2][0] - dL_dMt[0][2]) + 2 * z * (dL_dMt[1][2] + dL_dMt[2][1]) - 4 * y * (dL_dMt[2][2] + dL_dMt[0][0]);
+	// dR_dz from math gsplat
 	dL_dq.w = 2 * r * (dL_dMt[0][1] - dL_dMt[1][0]) + 2 * x * (dL_dMt[2][0] + dL_dMt[0][2]) + 2 * y * (dL_dMt[1][2] + dL_dMt[2][1]) - 4 * z * (dL_dMt[1][1] + dL_dMt[0][0]);
 
 	// Gradients of loss w.r.t. unnormalized quaternion
+	// 这边还有个q的归一化产生的gradient
 	float4* dL_drot = (float4*)(dL_drots + idx);
 	*dL_drot = float4{ dL_dq.x, dL_dq.y, dL_dq.z, dL_dq.w };//dnormvdv(float4{ rot.x, rot.y, rot.z, rot.w }, float4{ dL_dq.x, dL_dq.y, dL_dq.z, dL_dq.w });
 }
@@ -399,7 +413,7 @@ __global__ void preprocessCUDA(
     float3 m = means[idx];
 
     // Taking care of gradients from the screenspace points
-    // 世界系下点u --> ray系下点t'
+    // 世界系下点u --> ray系(ND系)下点t'
     float4 m_hom = transformPoint4x4(m, proj);
     float m_w = 1.0f / (m_hom.w + 0.0000001f);
 
